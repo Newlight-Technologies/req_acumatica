@@ -19,7 +19,7 @@ defmodule ReqAcumaticaTest do
       auth_header =
         Enum.find(client.headers, fn {k, _} -> k == "authorization" end)
 
-      assert {"authorization", "Basic " <> _} = auth_header
+      assert {"authorization", ["Basic " <> _]} = auth_header
     end
 
     test "builds client with bearer auth" do
@@ -33,7 +33,7 @@ defmodule ReqAcumaticaTest do
       auth_header =
         Enum.find(client.headers, fn {k, _} -> k == "authorization" end)
 
-      assert {"authorization", "Bearer my-token-123"} = auth_header
+      assert {"authorization", ["Bearer my-token-123"]} = auth_header
     end
 
     test "sets JSON accept header" do
@@ -47,7 +47,7 @@ defmodule ReqAcumaticaTest do
       accept_header =
         Enum.find(client.headers, fn {k, _} -> k == "accept" end)
 
-      assert {"accept", "application/json"} = accept_header
+      assert {"accept", ["application/json"]} = accept_header
     end
 
     test "encodes tenant with spaces" do

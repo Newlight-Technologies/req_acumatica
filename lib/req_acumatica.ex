@@ -30,10 +30,12 @@ defmodule ReqAcumatica do
 
   ## Authentication
 
-  Two auth methods are supported:
+  Three auth methods are supported:
 
   - **Basic Auth**: `{:basic, username, password}`
   - **OAuth2 Bearer**: `{:bearer, token}` (obtain token separately via Connected Applications)
+  - **OAuth2 Resource Owner**: `{:oauth2, client_id, client_secret, username, password}` —
+    automatically acquires and refreshes tokens via Acumatica's Connected Applications
 
   ## OData Query Options
 
@@ -52,6 +54,9 @@ defmodule ReqAcumatica do
   @type auth ::
           {:basic, username :: String.t(), password :: String.t()}
           | {:bearer, token :: String.t()}
+          | {:oauth2, client_id :: String.t(), client_secret :: String.t(),
+             username :: String.t(), password :: String.t()}
+          | {:oauth2_token, ReqAcumatica.Auth.t()}
 
   @type query_opt ::
           {:filter, String.t()}
@@ -72,21 +77,34 @@ defmodule ReqAcumatica do
     * `:tenant` (required) — The tenant/company name
       (e.g. `"NEWLIGHT LIVE"`)
 
-    * `:auth` (required) — Authentication credentials. Either:
+    * `:auth` (required) — Authentication credentials. One of:
       - `{:basic, username, password}` for Basic Auth
-      - `{:bearer, token}` for OAuth2 Bearer token
+      - `{:bearer, token}` for a pre-obtained OAuth2 Bearer token
+      - `{:oauth2, client_id, client_secret, username, password}` for automatic
+        OAuth2 token acquisition and refresh via Connected Applications
+      - `{:oauth2_token, %ReqAcumatica.Auth{}}` for a pre-acquired token struct
+
+    * `:scope` — OAuth2 scope (default: `"api offline_access"`). Only used with `:oauth2` auth.
 
     * `:req_options` — Additional options passed to `Req.new/1`
 
   ## Examples
 
+      # Basic Auth
       client = ReqAcumatica.new(
         base_url: "https://newlight.acumatica.com",
         tenant: "NEWLIGHT LIVE",
         auth: {:basic, "apiuser", "secret"}
       )
+
+      # OAuth2 with automatic token management
+      client = ReqAcumatica.new(
+        base_url: "https://newlight.acumatica.com",
+        tenant: "NEWLIGHT LIVE",
+        auth: {:oauth2, "client-id", "client-secret", "apiuser", "password"}
+      )
   """
-  @spec new(keyword()) :: client()
+  @spec new(keyword()) :: client() | {:error, term()}
   def new(opts) do
     base_url = Keyword.fetch!(opts, :base_url)
     tenant = Keyword.fetch!(opts, :tenant)
@@ -96,17 +114,24 @@ defmodule ReqAcumatica do
     encoded_tenant = URI.encode(tenant)
     odata_base = "#{String.trim_trailing(base_url, "/")}/odata/#{encoded_tenant}"
 
-    auth_headers = build_auth_headers(auth)
+    case resolve_auth(auth, base_url, tenant, opts) do
+      {:ok, auth_headers, resolved_auth} ->
+        req_options
+        |> Keyword.merge(
+          base_url: odata_base,
+          headers: [{"accept", "application/json"} | auth_headers]
+        )
+        |> Req.new()
+        |> Req.Request.register_options([:acumatica_tenant, :acumatica_auth])
+        |> Req.Request.put_private(:acumatica_tenant, tenant)
+        |> Req.Request.put_private(:acumatica_auth, resolved_auth)
+        |> Req.Request.put_private(:acumatica_base_url, base_url)
+        |> Req.Request.put_private(:acumatica_oauth2_opts, oauth2_private_opts(auth, opts))
+        |> maybe_attach_token_refresh(resolved_auth)
 
-    req_options
-    |> Keyword.merge(
-      base_url: odata_base,
-      headers: [{"accept", "application/json"} | auth_headers]
-    )
-    |> Req.new()
-    |> Req.Request.register_options([:acumatica_tenant, :acumatica_auth])
-    |> Req.Request.put_private(:acumatica_tenant, tenant)
-    |> Req.Request.put_private(:acumatica_auth, auth)
+      {:error, _} = error ->
+        error
+    end
   end
 
   @doc """
@@ -280,16 +305,115 @@ defmodule ReqAcumatica do
     )
   end
 
-  # -- Private --
+  # -- Private: Auth Resolution --
 
-  defp build_auth_headers({:basic, username, password}) do
+  defp resolve_auth({:basic, username, password}, _base_url, _tenant, _opts) do
     encoded = Base.encode64("#{username}:#{password}")
-    [{"authorization", "Basic #{encoded}"}]
+    {:ok, [{"authorization", "Basic #{encoded}"}], {:basic, username, password}}
   end
 
-  defp build_auth_headers({:bearer, token}) do
-    [{"authorization", "Bearer #{token}"}]
+  defp resolve_auth({:bearer, token}, _base_url, _tenant, _opts) do
+    {:ok, [{"authorization", "Bearer #{token}"}], {:bearer, token}}
   end
+
+  defp resolve_auth(
+         {:oauth2, client_id, client_secret, username, password},
+         base_url,
+         tenant,
+         opts
+       ) do
+    scope = Keyword.get(opts, :scope, "api offline_access")
+
+    case ReqAcumatica.Auth.acquire_token(
+           base_url: base_url,
+           client_id: client_id,
+           client_secret: client_secret,
+           username: username,
+           password: password,
+           tenant: tenant,
+           scope: scope
+         ) do
+      {:ok, token} ->
+        {:ok, [{"authorization", "Bearer #{token.access_token}"}], {:oauth2_token, token}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp resolve_auth({:oauth2_token, %ReqAcumatica.Auth{} = token}, _base_url, _tenant, _opts) do
+    {:ok, [{"authorization", "Bearer #{token.access_token}"}], {:oauth2_token, token}}
+  end
+
+  defp oauth2_private_opts({:oauth2, client_id, client_secret, username, password}, opts) do
+    %{
+      client_id: client_id,
+      client_secret: client_secret,
+      username: username,
+      password: password,
+      scope: Keyword.get(opts, :scope, "api offline_access")
+    }
+  end
+
+  defp oauth2_private_opts(_auth, _opts), do: nil
+
+  defp maybe_attach_token_refresh(req, {:oauth2_token, _token}) do
+    Req.Request.prepend_request_steps(req, acumatica_token_refresh: &token_refresh_step/1)
+  end
+
+  defp maybe_attach_token_refresh(req, _auth), do: req
+
+  defp token_refresh_step(request) do
+    token =
+      case request.private[:acumatica_auth] do
+        {:oauth2_token, t} -> t
+        _ -> nil
+      end
+
+    if token && ReqAcumatica.Auth.expired?(token) do
+      base_url = request.private[:acumatica_base_url]
+      oauth2_opts = request.private[:acumatica_oauth2_opts]
+
+      case refresh_or_reacquire(token, base_url, oauth2_opts) do
+        {:ok, new_token} ->
+          request
+          |> Req.Request.put_private(:acumatica_auth, {:oauth2_token, new_token})
+          |> Req.Request.put_header("authorization", "Bearer #{new_token.access_token}")
+
+        {:error, _} ->
+          request
+      end
+    else
+      request
+    end
+  end
+
+  defp refresh_or_reacquire(
+         token,
+         base_url,
+         %{client_id: client_id, client_secret: client_secret} = oauth2_opts
+       ) do
+    refresh_opts = [base_url: base_url, client_id: client_id, client_secret: client_secret]
+
+    case ReqAcumatica.Auth.refresh_token(token, refresh_opts) do
+      {:ok, _} = success ->
+        success
+
+      {:error, _} ->
+        ReqAcumatica.Auth.acquire_token(
+          base_url: base_url,
+          client_id: client_id,
+          client_secret: client_secret,
+          username: oauth2_opts.username,
+          password: oauth2_opts.password,
+          scope: oauth2_opts.scope
+        )
+    end
+  end
+
+  defp refresh_or_reacquire(_token, _base_url, _opts), do: {:error, :no_oauth2_config}
+
+  # -- Private: Query Building --
 
   defp build_query_params(opts) do
     opts
@@ -298,7 +422,7 @@ defmodule ReqAcumatica do
       {:top, value}, acc -> [{"$top", to_string(value)} | acc]
       {:skip, value}, acc -> [{"$skip", to_string(value)} | acc]
       {:orderby, value}, acc -> [{"$orderby", value} | acc]
-      {:select, fields, }, acc when is_list(fields) -> [{"$select", Enum.join(fields, ",")} | acc]
+      {:select, fields}, acc when is_list(fields) -> [{"$select", Enum.join(fields, ",")} | acc]
       {:select, value}, acc -> [{"$select", value} | acc]
       {:format, :json}, acc -> [{"$format", "json"} | acc]
       {:format, :atom}, acc -> [{"$format", "atom"} | acc]
