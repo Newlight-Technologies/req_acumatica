@@ -1,8 +1,10 @@
 # ReqAcumatica
 
-[Req](https://hex.pm/packages/req) plugin for the [Acumatica](https://www.acumatica.com/) OData API.
+[Req](https://hex.pm/packages/req) plugin for the [Acumatica](https://www.acumatica.com/) API.
 
-Query Generic Inquiries exposed via OData from Elixir with a clean, composable API.
+Provides authenticated access to both the **OData API** (Generic Inquiries) and the
+**Contract-Based REST API** (entity CRUD + actions) following the
+[Dashbit Req SDK pattern](https://dashbit.co/blog/sdks-with-req-s3).
 
 ## Installation
 
@@ -17,18 +19,15 @@ end
 ## Quick Start
 
 ```elixir
-# Create a client
-client = ReqAcumatica.new(
+# Create a client (convenience for Req.new() |> ReqAcumatica.attach(...))
+req = ReqAcumatica.new(
   base_url: "https://mycompany.acumatica.com",
   tenant: "MY TENANT",
   auth: {:basic, "apiuser", "secret"}
 )
 
-# List available Generic Inquiries
-{:ok, inquiries} = ReqAcumatica.list_inquiries(client)
-
-# Query a GI with OData filters
-{:ok, result} = ReqAcumatica.query(client, "Sales Orders and Quotes",
+# OData: Query a Generic Inquiry
+{:ok, result} = ReqAcumatica.OData.query(req, "Sales Orders and Quotes",
   filter: "Status eq 'Open'",
   top: 25,
   orderby: "OrderTotal desc"
@@ -36,6 +35,118 @@ client = ReqAcumatica.new(
 
 result.rows
 # => [%{"OrderNbr" => "SO-001234", "Status" => "Open", ...}, ...]
+
+# REST: Get a sales order
+{:ok, order} = ReqAcumatica.REST.get(req, "SalesOrder/SO-001234")
+
+# REST: Create a customer
+{:ok, customer} = ReqAcumatica.REST.create(req, "Customer", %{
+  "CustomerID" => %{"value" => "NEWCUST"},
+  "CustomerName" => %{"value" => "New Customer Inc"}
+})
+```
+
+## Plugin Pattern
+
+Following the Dashbit Req SDK pattern, `ReqAcumatica` is a Req plugin.
+Use `attach/2` to augment any existing Req request:
+
+```elixir
+# Attach to an existing Req with custom options
+req = Req.new(retry: :transient, connect_options: [timeout: 30_000])
+      |> ReqAcumatica.attach(
+        base_url: "https://mycompany.acumatica.com",
+        tenant: "MY TENANT",
+        auth: {:oauth2, "client-id", "client-secret", "user", "pass"}
+      )
+
+# Or use the convenience function
+req = ReqAcumatica.new(
+  base_url: "https://mycompany.acumatica.com",
+  tenant: "MY TENANT",
+  auth: {:basic, "apiuser", "secret"},
+  req_options: [retry: :transient]
+)
+
+# Low-level: use Req directly with the configured client
+{:ok, resp} = ReqAcumatica.request(req, url: "/custom/endpoint")
+resp = ReqAcumatica.request!(req, url: "/custom/endpoint")
+```
+
+## OData API (Generic Inquiries)
+
+Read-only access to Acumatica Generic Inquiries via `ReqAcumatica.OData`.
+
+```elixir
+# List available GIs
+{:ok, inquiries} = ReqAcumatica.OData.list_inquiries(req)
+
+# Query with filters
+{:ok, result} = ReqAcumatica.OData.query(req, "Shipment Labels with GI V7",
+  filter: "Status eq 'Shipping'",
+  top: 100,
+  select: ["OrderNbr", "ShipmentNbr", "CustomerName"]
+)
+
+# Get metadata (XML)
+{:ok, xml} = ReqAcumatica.OData.metadata(req, "InvoicedItems")
+
+# Paginate through all results
+{:ok, all} = ReqAcumatica.OData.query_all(req, "Large Inquiry",
+  page_size: 200,
+  max_results: 5000
+)
+
+# Lazy streaming (memory-efficient)
+req
+|> ReqAcumatica.OData.stream("Inventory Items", page_size: 100)
+|> Stream.filter(& &1["QtyOnHand"] > 0)
+|> Enum.take(50)
+```
+
+## REST API (Entity CRUD + Actions)
+
+Full create/read/update/delete on Acumatica business entities via `ReqAcumatica.REST`.
+
+```elixir
+# List entities with filters
+{:ok, orders} = ReqAcumatica.REST.list(req, "SalesOrder",
+  filter: "Status eq 'Open'",
+  top: 50,
+  expand: "Details"
+)
+
+# Get a single entity by key
+{:ok, order} = ReqAcumatica.REST.get(req, "SalesOrder/SO-001234")
+
+# Create (Acumatica uses PUT for create/upsert)
+{:ok, created} = ReqAcumatica.REST.create(req, "SalesOrder", %{
+  "OrderType" => %{"value" => "SO"},
+  "CustomerID" => %{"value" => "CUSTOMER01"},
+  "Description" => %{"value" => "New order from API"}
+})
+
+# Update (include key fields to identify the record)
+{:ok, updated} = ReqAcumatica.REST.update(req, "SalesOrder", %{
+  "OrderType" => %{"value" => "SO"},
+  "OrderNbr" => %{"value" => "SO-001234"},
+  "Description" => %{"value" => "Updated via API"}
+})
+
+# Delete
+:ok = ReqAcumatica.REST.delete(req, "Customer/OLDCUST")
+
+# Invoke entity action
+{:ok, _} = ReqAcumatica.REST.action(req, "SalesOrder", "ReleaseFromHold", %{
+  "entity" => %{
+    "OrderType" => %{"value" => "SO"},
+    "OrderNbr" => %{"value" => "SO-001234"}
+  }
+})
+
+# Unwrap Acumatica's %{"value" => x} format
+flat = ReqAcumatica.REST.unwrap_values(order)
+# %{"OrderNbr" => "SO-001", "Status" => "Open", ...}
 ```
 
 ## Filter Builder
@@ -50,28 +161,7 @@ filter =
   |> and_filter(gt("OrderTotal", 1000))
   |> and_filter(contains("CustomerName", "Newlight"))
 
-ReqAcumatica.query(client, "Sales Orders", filter: to_string(filter))
-```
-
-## Pagination
-
-### Fetch all results
-
-```elixir
-{:ok, result} = ReqAcumatica.query_all(client, "Large Inquiry",
-  filter: "Active eq true",
-  page_size: 200,
-  max_results: 5000
-)
-```
-
-### Lazy streaming
-
-```elixir
-client
-|> ReqAcumatica.stream("Inventory Items", page_size: 100)
-|> Stream.filter(& &1["QtyOnHand"] > 0)
-|> Enum.take(50)
+ReqAcumatica.OData.query(req, "Sales Orders", filter: to_string(filter))
 ```
 
 ## Authentication
@@ -90,9 +180,6 @@ ReqAcumatica.new(
 
 ### OAuth2 Bearer Token (pre-obtained)
 
-Obtain a token via Acumatica's Connected Applications (SM303010 screen),
-then pass it directly:
-
 ```elixir
 ReqAcumatica.new(
   base_url: "https://mycompany.acumatica.com",
@@ -103,15 +190,11 @@ ReqAcumatica.new(
 
 ### OAuth2 Resource Owner (automatic token management)
 
-Uses Acumatica's `/identity/connect/token` endpoint with `grant_type=password`.
-The token is acquired automatically on client creation and refreshed transparently
-before expiry on each request.
-
-**Prerequisites:** Create a Connected Application in Acumatica (SM303010 screen)
-with Flow Type = "Resource Owner Password Credentials".
+Uses `/identity/connect/token` with `grant_type=password`. Requires a Connected
+Application (SM303010) with Flow Type = "Resource Owner Password Credentials".
 
 ```elixir
-client = ReqAcumatica.new(
+req = ReqAcumatica.new(
   base_url: "https://mycompany.acumatica.com",
   tenant: "MY TENANT",
   auth: {:oauth2, "client-id", "client-secret", "apiuser", "password"},
@@ -119,16 +202,12 @@ client = ReqAcumatica.new(
 )
 ```
 
-The client embeds a Req request step that automatically refreshes the token when
-it's about to expire. If refresh fails, it falls back to a full re-acquisition.
+Tokens are refreshed transparently before expiry on each request.
 
 ## ClientServer (long-lived cached client)
 
 For applications that make many requests, `ReqAcumatica.ClientServer` provides a
-GenServer that holds a single shared client and proactively refreshes its token
-before expiry.
-
-### Configuration
+GenServer that holds a shared client and proactively refreshes its OAuth2 token.
 
 ```elixir
 # config/runtime.exs
@@ -141,43 +220,21 @@ config :req_acumatica,
     System.fetch_env!("ACUMATICA_USERNAME"),
     System.fetch_env!("ACUMATICA_PASSWORD")},
   scope: "api offline_access"
-```
 
-### Supervision tree
-
-```elixir
 # application.ex
-children = [
-  ReqAcumatica.ClientServer
-]
-```
+children = [ReqAcumatica.ClientServer]
 
-### Usage
-
-```elixir
-{:ok, client} = ReqAcumatica.ClientServer.get_client()
-{:ok, result} = ReqAcumatica.query(client, "My Inquiry")
-```
-
-## OData URL Pattern
-
-For Acumatica, the OData endpoint follows this pattern:
-
-```
-https://{instance}/odata/{Tenant Name}/{Generic Inquiry Name}
-```
-
-For example:
-```
-https://newlight.acumatica.com/odata/NEWLIGHT%20LIVE/Sales%20Orders%20and%20Quotes
+# usage
+{:ok, req} = ReqAcumatica.ClientServer.get_client()
+{:ok, result} = ReqAcumatica.OData.query(req, "My Inquiry")
 ```
 
 ## Using with Ash Framework and Daisy
 
-This library is designed to integrate with [Ash](https://hexdocs.pm/ash/) manual
-actions, allowing Acumatica Generic Inquiries to be exposed as Ash resources.
-In Daisy, users authenticate via LDAP — the Acumatica connection uses a shared
-service account so users don't need separate Acumatica credentials.
+This library integrates with [Ash](https://hexdocs.pm/ash/) manual actions,
+allowing Acumatica data to be exposed as Ash resources. In Daisy, users authenticate
+via LDAP — the Acumatica connection uses a shared service account so users
+don't need separate credentials.
 
 ### Architecture
 
@@ -197,33 +254,33 @@ service account so users don't need separate Acumatica credentials.
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  Ash Resource (Ash.DataLayer.Simple)                        │
-│  Manual read action → calls ReqAcumatica                    │
-│  Maps OData rows → Ash resource structs                     │
+│  Manual read action → calls ReqAcumatica.OData / REST      │
+│  Maps API response → Ash resource structs                   │
 └──────────────────────┬──────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  ReqAcumatica.ClientServer                                  │
 │  Shared OAuth2 service account, auto-refreshing token       │
-│  Configured from app env vars                               │
 └──────────────────────┬──────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Acumatica OData API                                        │
-│  GET /odata/{tenant}/{GI Name}?$filter=...&$top=...         │
+│  Acumatica APIs                                             │
+│  OData: GET /odata/{tenant}/{GI}?$filter=...                │
+│  REST:  GET/PUT/DELETE /entity/Default/{ver}/{Entity}       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Step 1: Add dependency to Daisy
+### Setup in Daisy
 
+**1. Add dependency:**
 ```elixir
 # mix.exs
 {:req_acumatica, path: "../req_acumatica"}
 ```
 
-### Step 2: Configure the service account
-
+**2. Configure service account:**
 ```elixir
 # config/runtime.exs
 config :req_acumatica,
@@ -233,116 +290,72 @@ config :req_acumatica,
     System.fetch_env!("ACUMATICA_CLIENT_ID"),
     System.fetch_env!("ACUMATICA_CLIENT_SECRET"),
     System.fetch_env!("ACUMATICA_USERNAME"),
-    System.fetch_env!("ACUMATICA_PASSWORD")},
-  scope: "api offline_access"
+    System.fetch_env!("ACUMATICA_PASSWORD")}
 ```
 
-### Step 3: Add ClientServer to supervision tree
-
+**3. Add to supervision tree:**
 ```elixir
 # lib/daisy/application.ex
 children = [
-  # ... existing children ...
+  # ...
   ReqAcumatica.ClientServer
 ]
 ```
 
-### Step 4: Define an Ash resource wrapping a Generic Inquiry
-
+**4. Define Ash resource with manual read:**
 ```elixir
 defmodule Daisy.Acumatica.ShipmentDetail do
-  use Ash.Resource,
-    domain: Daisy.Acumatica
-
-  # No data layer — manual reads from external API
+  use Ash.Resource, domain: Daisy.Acumatica
 
   attributes do
     attribute :order_nbr, :string, primary_key?: true, allow_nil?: false, public?: true
     attribute :shipment_nbr, :string, public?: true
-    attribute :customer_id, :string, public?: true
     attribute :customer_name, :string, public?: true
     attribute :status, :string, public?: true
-    attribute :inventory_id, :string, public?: true
     attribute :ship_date, :date, public?: true
-    attribute :shipped_qty, :integer, public?: true
-    attribute :uom, :string, public?: true
-    attribute :description, :string, public?: true
+    # ... more fields from the GI
   end
 
   actions do
     read :list do
       argument :status, :string
-      argument :customer_name, :string
-
       manual Daisy.Acumatica.ShipmentDetail.ListAction
     end
   end
 end
 ```
 
-### Step 5: Implement the manual read action
-
+**5. Implement manual read action:**
 ```elixir
 defmodule Daisy.Acumatica.ShipmentDetail.ListAction do
   use Ash.Resource.ManualRead
 
-  @gi_name "Shipment Labels with GI V7"
-
   @impl true
   def read(query, _data_layer_query, _opts, _context) do
-    with {:ok, client} <- ReqAcumatica.ClientServer.get_client() do
-      odata_opts = build_odata_opts(query)
-
-      case ReqAcumatica.query(client, @gi_name, odata_opts) do
-        {:ok, result} ->
-          records = Enum.map(result.rows, &row_to_struct/1)
-          {:ok, records}
-
-        {:error, error} ->
-          {:error, error}
+    with {:ok, req} <- ReqAcumatica.ClientServer.get_client() do
+      case ReqAcumatica.OData.query(req, "Shipment Labels with GI V7", top: 200) do
+        {:ok, result} -> {:ok, Enum.map(result.rows, &row_to_struct/1)}
+        {:error, error} -> {:error, error}
       end
     end
-  end
-
-  defp build_odata_opts(query) do
-    opts = [top: 200]
-
-    opts =
-      case Ash.Query.get_argument(query, :status) do
-        nil -> opts
-        status -> Keyword.put(opts, :filter, "Status eq '#{status}'")
-      end
-
-    opts
   end
 
   defp row_to_struct(row) do
     %Daisy.Acumatica.ShipmentDetail{
       order_nbr: row["OrderNbr"],
       shipment_nbr: row["ShipmentNbr"],
-      customer_id: row["CustomerID"],
       customer_name: row["CustomerName"],
       status: row["Status"],
-      inventory_id: row["InventoryID"],
-      ship_date: parse_date(row["ShipDate"]),
-      shipped_qty: row["ShippedQty"],
-      uom: row["UOM"],
-      description: row["Description"]
+      ship_date: parse_date(row["ShipDate"])
     }
   end
 
   defp parse_date(nil), do: nil
-  defp parse_date(date_string) do
-    case Date.from_iso8601(date_string) do
-      {:ok, date} -> date
-      _ -> nil
-    end
-  end
+  defp parse_date(s), do: case Date.from_iso8601(s), do: ({:ok, d} -> d; _ -> nil)
 end
 ```
 
-### Step 6: Define the Ash domain with code interfaces
-
+**6. Domain with code interfaces:**
 ```elixir
 defmodule Daisy.Acumatica do
   use Ash.Domain
@@ -355,39 +368,12 @@ defmodule Daisy.Acumatica do
 end
 ```
 
-### Step 7: Use from LiveViews
-
-The logged-in LDAP user is the actor — no separate Acumatica login needed:
-
+**7. Use from LiveView (LDAP user is the actor):**
 ```elixir
-defmodule DaisyWeb.Acumatica.ShipmentLive do
-  use DaisyWeb, :live_view
-
-  def mount(_params, _session, socket) do
-    shipments =
-      Daisy.Acumatica.list_shipment_details!(
-        %{status: "Shipping"},
-        actor: socket.assigns.current_user
-      )
-
-    {:ok, assign(socket, :shipments, shipments)}
-  end
-end
-```
-
-### Step 8: Add Ash policies for authorization
-
-Control which LDAP users can access Acumatica data:
-
-```elixir
-# In ShipmentDetail resource
-policies do
-  policy action_type(:read) do
-    authorize_if actor_present()
-    # Or restrict to specific LDAP groups:
-    # authorize_if expr(^actor(:ldap_groups) |> contains("acumatica-users"))
-  end
-end
+shipments = Daisy.Acumatica.list_shipment_details!(
+  %{status: "Shipping"},
+  actor: socket.assigns.current_user
+)
 ```
 
 ## License

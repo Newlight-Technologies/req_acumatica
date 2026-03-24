@@ -1,8 +1,8 @@
 defmodule ReqAcumatica.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
-  @source_url "https://github.com/newlight-tech/req_acumatica"
+  @version "0.2.0"
+  @source_url "https://github.com/Newlight-Technologies/req_acumatica"
 
   def project do
     [
@@ -14,7 +14,7 @@ defmodule ReqAcumatica.MixProject do
       docs: docs(),
       package: package(),
       name: "ReqAcumatica",
-      description: "Req plugin for Acumatica OData / Generic Inquiry API"
+      description: "Req plugin for Acumatica OData and Contract-Based REST APIs"
     ]
   end
 

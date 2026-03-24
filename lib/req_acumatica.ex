@@ -1,55 +1,40 @@
 defmodule ReqAcumatica do
   @moduledoc """
-  Req plugin for the Acumatica OData API (Generic Inquiries).
+  Req plugin for the [Acumatica](https://www.acumatica.com/) API.
 
-  Provides a configured `Req.Request` for querying Acumatica Generic Inquiries
-  exposed via OData. Handles authentication (Basic Auth or OAuth2) and provides
-  helper functions for building OData queries.
+  Provides authenticated access to both the **OData API** (Generic Inquiries)
+  and the **Contract-Based REST API** (entity CRUD + actions).
 
-  ## Quick start
+  ## Plugin pattern
 
-      # Create a client
-      client = ReqAcumatica.new(
-        base_url: "https://mycompany.acumatica.com",
-        tenant: "MY TENANT",
-        auth: {:basic, "admin", "password123"}
-      )
+  Following the [Dashbit Req SDK pattern](https://dashbit.co/blog/sdks-with-req-s3),
+  `ReqAcumatica` is a Req plugin. Use `attach/2` to augment any Req request,
+  or `new/1` as a convenience:
 
-      # List available Generic Inquiries
-      {:ok, inquiries} = ReqAcumatica.list_inquiries(client)
+      # Plugin style
+      req = Req.new() |> ReqAcumatica.attach(base_url: "...", tenant: "...", auth: {...})
 
-      # Query a Generic Inquiry
-      {:ok, results} = ReqAcumatica.query(client, "Sales Orders and Quotes",
-        filter: "Status eq 'Open'",
-        top: 25,
-        orderby: "OrderTotal desc"
-      )
+      # Convenience
+      req = ReqAcumatica.new(base_url: "...", tenant: "...", auth: {...})
 
-      # Get metadata for a Generic Inquiry
-      {:ok, metadata} = ReqAcumatica.metadata(client, "InvoicedItems")
+  Then use the high-level modules for operations:
+
+      # OData Generic Inquiries (read-only)
+      {:ok, result} = ReqAcumatica.OData.query(req, "Sales Orders and Quotes", top: 25)
+
+      # REST API (full CRUD)
+      {:ok, order} = ReqAcumatica.REST.get(req, "SalesOrder", "SO-001234")
+      {:ok, created} = ReqAcumatica.REST.create(req, "SalesOrder", %{...})
 
   ## Authentication
 
   Three auth methods are supported:
 
-  - **Basic Auth**: `{:basic, username, password}`
-  - **OAuth2 Bearer**: `{:bearer, token}` (obtain token separately via Connected Applications)
-  - **OAuth2 Resource Owner**: `{:oauth2, client_id, client_secret, username, password}` —
-    automatically acquires and refreshes tokens via Acumatica's Connected Applications
-
-  ## OData Query Options
-
-  Standard OData query parameters are supported:
-
-  - `$filter` — OData filter expressions (e.g. `"Status eq 'Open'"`)
-  - `$top` — limit number of results
-  - `$skip` — skip N results (for pagination)
-  - `$orderby` — sort results
-  - `$select` — select specific fields
-  - `$format` — response format (defaults to JSON)
+  - `{:basic, username, password}` — Basic Auth header
+  - `{:bearer, token}` — Pre-obtained OAuth2 Bearer token
+  - `{:oauth2, client_id, client_secret, username, password}` — Automatic token
+    acquisition and refresh via Acumatica Connected Applications (SM303010)
   """
-
-  @type client :: Req.Request.t()
 
   @type auth ::
           {:basic, username :: String.t(), password :: String.t()}
@@ -58,74 +43,45 @@ defmodule ReqAcumatica do
              username :: String.t(), password :: String.t()}
           | {:oauth2_token, ReqAcumatica.Auth.t()}
 
-  @type query_opt ::
-          {:filter, String.t()}
-          | {:top, pos_integer()}
-          | {:skip, non_neg_integer()}
-          | {:orderby, String.t()}
-          | {:select, String.t() | [String.t()]}
-          | {:format, :json | :atom}
-
   @doc """
-  Creates a new Acumatica OData client.
+  Attaches the Acumatica plugin to a `Req.Request`.
+
+  This is the core plugin entry point. It configures authentication,
+  stores connection metadata in private fields, and attaches request
+  steps for automatic OAuth2 token refresh.
 
   ## Options
 
-    * `:base_url` (required) — The base URL of the Acumatica instance
-      (e.g. `"https://mycompany.acumatica.com"`)
-
-    * `:tenant` (required) — The tenant/company name
-      (e.g. `"NEWLIGHT LIVE"`)
-
-    * `:auth` (required) — Authentication credentials. One of:
-      - `{:basic, username, password}` for Basic Auth
-      - `{:bearer, token}` for a pre-obtained OAuth2 Bearer token
-      - `{:oauth2, client_id, client_secret, username, password}` for automatic
-        OAuth2 token acquisition and refresh via Connected Applications
-      - `{:oauth2_token, %ReqAcumatica.Auth{}}` for a pre-acquired token struct
-
-    * `:scope` — OAuth2 scope (default: `"api offline_access"`). Only used with `:oauth2` auth.
-
-    * `:req_options` — Additional options passed to `Req.new/1`
+    * `:base_url` (required) — The Acumatica instance URL (e.g. `"https://mycompany.acumatica.com"`)
+    * `:tenant` (required) — The tenant/company name (e.g. `"NEWLIGHT LIVE"`)
+    * `:auth` (required) — Authentication credentials (see module docs)
+    * `:scope` — OAuth2 scope (default: `"api offline_access"`)
+    * `:api_version` — REST API contract version (default: `"24.200.001"`)
 
   ## Examples
 
-      # Basic Auth
-      client = ReqAcumatica.new(
-        base_url: "https://newlight.acumatica.com",
-        tenant: "NEWLIGHT LIVE",
-        auth: {:basic, "apiuser", "secret"}
-      )
-
-      # OAuth2 with automatic token management
-      client = ReqAcumatica.new(
-        base_url: "https://newlight.acumatica.com",
-        tenant: "NEWLIGHT LIVE",
-        auth: {:oauth2, "client-id", "client-secret", "apiuser", "password"}
-      )
+      req = Req.new(retry: :transient)
+            |> ReqAcumatica.attach(
+              base_url: "https://newlight.acumatica.com",
+              tenant: "NEWLIGHT LIVE",
+              auth: {:basic, "apiuser", "secret"}
+            )
   """
-  @spec new(keyword()) :: client() | {:error, term()}
-  def new(opts) do
-    base_url = Keyword.fetch!(opts, :base_url)
+  @spec attach(Req.Request.t(), keyword()) :: Req.Request.t() | {:error, term()}
+  def attach(req, opts) do
+    base_url = Keyword.fetch!(opts, :base_url) |> String.trim_trailing("/")
     tenant = Keyword.fetch!(opts, :tenant)
     auth = Keyword.fetch!(opts, :auth)
-    req_options = Keyword.get(opts, :req_options, [])
-
-    encoded_tenant = URI.encode(tenant)
-    odata_base = "#{String.trim_trailing(base_url, "/")}/odata/#{encoded_tenant}"
+    api_version = Keyword.get(opts, :api_version, "24.200.001")
 
     case resolve_auth(auth, base_url, tenant, opts) do
       {:ok, auth_headers, resolved_auth} ->
-        req_options
-        |> Keyword.merge(
-          base_url: odata_base,
-          headers: [{"accept", "application/json"} | auth_headers]
-        )
-        |> Req.new()
-        |> Req.Request.register_options([:acumatica_tenant, :acumatica_auth])
+        req
+        |> Req.merge(headers: [{"accept", "application/json"} | auth_headers])
+        |> Req.Request.put_private(:acumatica_base_url, base_url)
         |> Req.Request.put_private(:acumatica_tenant, tenant)
         |> Req.Request.put_private(:acumatica_auth, resolved_auth)
-        |> Req.Request.put_private(:acumatica_base_url, base_url)
+        |> Req.Request.put_private(:acumatica_api_version, api_version)
         |> Req.Request.put_private(:acumatica_oauth2_opts, oauth2_private_opts(auth, opts))
         |> maybe_attach_token_refresh(resolved_auth)
 
@@ -135,174 +91,64 @@ defmodule ReqAcumatica do
   end
 
   @doc """
-  Lists all Generic Inquiries exposed via OData.
+  Creates a new Acumatica client. Convenience for `Req.new() |> attach(opts)`.
 
-  Returns the service document listing available entity sets (GIs).
-
-  ## Examples
-
-      {:ok, inquiries} = ReqAcumatica.list_inquiries(client)
-      # => ["Sales Orders and Quotes", "InvoicedItems", ...]
-  """
-  @spec list_inquiries(client()) :: {:ok, [String.t()]} | {:error, term()}
-  def list_inquiries(client) do
-    case Req.get(client, url: "") do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        names = parse_service_document(body)
-        {:ok, names}
-
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:error, %ReqAcumatica.Error{status: status, message: inspect(body)}}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  @doc """
-  Fetches OData `$metadata` for a specific Generic Inquiry.
-
-  Returns the raw XML metadata describing entity types, fields, and keys.
+  Accepts all options from `attach/2` plus any `Req.new/1` options via `:req_options`.
 
   ## Examples
 
-      {:ok, metadata_xml} = ReqAcumatica.metadata(client, "InvoicedItems")
-  """
-  @spec metadata(client(), String.t()) :: {:ok, String.t()} | {:error, term()}
-  def metadata(client, inquiry_name) do
-    # $metadata returns XML, override Accept header
-    url = "#{URI.encode(inquiry_name)}/$metadata"
-
-    case Req.get(client, url: url, headers: [{"accept", "application/xml"}]) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        {:ok, body}
-
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:error, %ReqAcumatica.Error{status: status, message: inspect(body)}}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  @doc """
-  Queries a Generic Inquiry via OData.
-
-  ## Options
-
-    * `:filter` — OData `$filter` expression string
-    * `:top` — maximum number of results to return
-    * `:skip` — number of results to skip
-    * `:orderby` — OData `$orderby` expression
-    * `:select` — fields to return (string or list of strings)
-    * `:format` — `:json` (default) or `:atom`
-
-  ## Examples
-
-      # Simple query
-      {:ok, results} = ReqAcumatica.query(client, "Sales Orders and Quotes")
-
-      # With filters and pagination
-      {:ok, results} = ReqAcumatica.query(client, "Sales Orders and Quotes",
-        filter: "Status eq 'Open' and OrderTotal gt 1000",
-        top: 50,
-        skip: 0,
-        orderby: "OrderTotal desc",
-        select: ["OrderNbr", "Status", "OrderTotal"]
+      req = ReqAcumatica.new(
+        base_url: "https://newlight.acumatica.com",
+        tenant: "NEWLIGHT LIVE",
+        auth: {:oauth2, "client-id", "client-secret", "apiuser", "password"}
       )
   """
-  @spec query(client(), String.t(), [query_opt()]) ::
-          {:ok, ReqAcumatica.Result.t()} | {:error, term()}
-  def query(client, inquiry_name, opts \\ []) do
-    params = build_query_params(opts)
-    url = URI.encode(inquiry_name)
+  @spec new(keyword()) :: Req.Request.t() | {:error, term()}
+  def new(opts) do
+    {req_options, attach_opts} = Keyword.pop(opts, :req_options, [])
 
-    case Req.get(client, url: url, params: params) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        result = ReqAcumatica.Result.from_odata_response(body)
-        {:ok, result}
-
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:error, %ReqAcumatica.Error{status: status, message: inspect(body)}}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    req_options
+    |> Req.new()
+    |> attach(attach_opts)
   end
 
   @doc """
-  Queries a Generic Inquiry and automatically paginates through all results.
+  Makes a request using the configured client. Delegates to `Req.request/2`.
 
-  Uses `$top` and `$skip` internally to fetch pages of `page_size` (default 200)
-  until all matching results are retrieved or `max_results` is reached.
-
-  ## Options
-
-  Accepts all options from `query/3`, plus:
-
-    * `:page_size` — number of results per page (default: 200)
-    * `:max_results` — maximum total results to fetch (default: `:infinity`)
+  Accepts any `Req.request/2` option.
 
   ## Examples
 
-      {:ok, all_orders} = ReqAcumatica.query_all(client, "Sales Orders and Quotes",
-        filter: "Status eq 'Open'",
-        max_results: 1000
-      )
+      {:ok, resp} = ReqAcumatica.request(req, url: "/entity/Default/24.200.001/SalesOrder")
   """
-  @spec query_all(client(), String.t(), keyword()) ::
-          {:ok, ReqAcumatica.Result.t()} | {:error, term()}
-  def query_all(client, inquiry_name, opts \\ []) do
-    page_size = Keyword.get(opts, :page_size, 200)
-    max_results = Keyword.get(opts, :max_results, :infinity)
-    query_opts = Keyword.drop(opts, [:page_size, :max_results])
-
-    do_paginate(client, inquiry_name, query_opts, page_size, max_results, 0, [])
+  @spec request(Req.Request.t(), keyword()) :: {:ok, Req.Response.t()} | {:error, term()}
+  def request(req, opts \\ []) do
+    Req.request(req, opts)
   end
 
   @doc """
-  Returns a lazy stream of results from a Generic Inquiry.
-
-  Useful for processing large result sets without loading everything into memory.
-
-  ## Examples
-
-      client
-      |> ReqAcumatica.stream("Large Inquiry", page_size: 100)
-      |> Stream.filter(& &1["Status"] == "Open")
-      |> Stream.take(50)
-      |> Enum.to_list()
+  Like `request/2` but raises on error.
   """
-  @spec stream(client(), String.t(), keyword()) :: Enumerable.t()
-  def stream(client, inquiry_name, opts \\ []) do
-    page_size = Keyword.get(opts, :page_size, 200)
-    query_opts = Keyword.drop(opts, [:page_size])
+  @spec request!(Req.Request.t(), keyword()) :: Req.Response.t()
+  def request!(req, opts \\ []) do
+    Req.request!(req, opts)
+  end
 
-    Stream.resource(
-      fn -> 0 end,
-      fn
-        :halt ->
-          {:halt, :done}
+  # -- URL Builders (used by OData and REST modules) --
 
-        skip ->
-          page_opts = Keyword.merge(query_opts, top: page_size, skip: skip)
+  @doc false
+  def odata_url(req, path \\ "") do
+    base = req.private[:acumatica_base_url]
+    tenant = req.private[:acumatica_tenant]
+    encoded_tenant = URI.encode(tenant)
+    "#{base}/odata/#{encoded_tenant}/#{path}"
+  end
 
-          case query(client, inquiry_name, page_opts) do
-            {:ok, %ReqAcumatica.Result{rows: []}} ->
-              {:halt, :done}
-
-            {:ok, %ReqAcumatica.Result{rows: rows}} when length(rows) < page_size ->
-              {rows, :halt}
-
-            {:ok, %ReqAcumatica.Result{rows: rows}} ->
-              {rows, skip + page_size}
-
-            {:error, error} ->
-              raise "ReqAcumatica stream error: #{inspect(error)}"
-          end
-      end,
-      fn _ -> :ok end
-    )
+  @doc false
+  def rest_url(req, path \\ "") do
+    base = req.private[:acumatica_base_url]
+    version = req.private[:acumatica_api_version]
+    "#{base}/entity/Default/#{version}/#{path}"
   end
 
   # -- Private: Auth Resolution --
@@ -412,60 +258,4 @@ defmodule ReqAcumatica do
   end
 
   defp refresh_or_reacquire(_token, _base_url, _opts), do: {:error, :no_oauth2_config}
-
-  # -- Private: Query Building --
-
-  defp build_query_params(opts) do
-    opts
-    |> Enum.reduce([], fn
-      {:filter, value}, acc -> [{"$filter", value} | acc]
-      {:top, value}, acc -> [{"$top", to_string(value)} | acc]
-      {:skip, value}, acc -> [{"$skip", to_string(value)} | acc]
-      {:orderby, value}, acc -> [{"$orderby", value} | acc]
-      {:select, fields}, acc when is_list(fields) -> [{"$select", Enum.join(fields, ",")} | acc]
-      {:select, value}, acc -> [{"$select", value} | acc]
-      {:format, :json}, acc -> [{"$format", "json"} | acc]
-      {:format, :atom}, acc -> [{"$format", "atom"} | acc]
-      _, acc -> acc
-    end)
-  end
-
-  defp parse_service_document(%{"value" => entities}) when is_list(entities) do
-    Enum.map(entities, fn
-      %{"name" => name} -> name
-      %{"url" => url} -> url
-    end)
-  end
-
-  defp parse_service_document(_body), do: []
-
-  defp do_paginate(_client, _name, _opts, _page_size, max, _skip, acc)
-       when max != :infinity and length(acc) >= max do
-    rows = Enum.take(acc, max)
-    {:ok, %ReqAcumatica.Result{rows: rows, count: length(rows)}}
-  end
-
-  defp do_paginate(client, name, opts, page_size, max, skip, acc) do
-    page_opts = Keyword.merge(opts, top: page_size, skip: skip)
-
-    case query(client, name, page_opts) do
-      {:ok, %ReqAcumatica.Result{rows: []}} ->
-        {:ok, %ReqAcumatica.Result{rows: acc, count: length(acc)}}
-
-      {:ok, %ReqAcumatica.Result{rows: rows}} ->
-        new_acc = acc ++ rows
-
-        if length(rows) < page_size do
-          total =
-            if max != :infinity, do: Enum.take(new_acc, max), else: new_acc
-
-          {:ok, %ReqAcumatica.Result{rows: total, count: length(total)}}
-        else
-          do_paginate(client, name, opts, page_size, max, skip + page_size, new_acc)
-        end
-
-      {:error, _} = error ->
-        error
-    end
-  end
 end
