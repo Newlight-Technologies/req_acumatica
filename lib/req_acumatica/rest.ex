@@ -295,6 +295,169 @@ defmodule ReqAcumatica.REST do
 
   def unwrap_values(other), do: other
 
+  # -- File Attachments --
+
+  @doc """
+  Uploads a file attachment to an entity.
+
+  Uses PUT with raw binary body to Acumatica's file attachment endpoint.
+
+  ## Examples
+
+      # Upload from file path
+      ReqAcumatica.REST.attach_file(req, "PurchaseOrder/PO-001", "invoice.pdf",
+        {:file, "/path/to/invoice.pdf"})
+
+      # Upload from binary
+      ReqAcumatica.REST.attach_file(req, "PurchaseOrder/PO-001", "data.csv",
+        {:binary, csv_content})
+  """
+  @spec attach_file(
+          Req.Request.t(),
+          String.t(),
+          String.t(),
+          {:file, String.t()} | {:binary, binary()}
+        ) ::
+          :ok | {:error, term()}
+  def attach_file(req, entity_path, filename, source) do
+    url = ReqAcumatica.rest_url(req, "#{entity_path}/files/#{URI.encode(filename)}")
+
+    body =
+      case source do
+        {:file, path} -> File.stream!(path, [], 65_536)
+        {:binary, data} -> data
+      end
+
+    case Req.put(req,
+           url: url,
+           body: body,
+           headers: [{"content-type", "application/octet-stream"}]
+         ) do
+      {:ok, %Req.Response{status: status}} when status in [200, 204] -> :ok
+      {:ok, resp} -> {:error, error_from_response(resp)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Downloads a file attachment from an entity.
+
+  Returns the raw binary content.
+
+  ## Examples
+
+      {:ok, binary} = ReqAcumatica.REST.download_file(req, "PurchaseOrder/PO-001", "invoice.pdf")
+
+      # Download to file
+      {:ok, binary} = ReqAcumatica.REST.download_file(req, "PurchaseOrder/PO-001", "invoice.pdf")
+      File.write!("/tmp/invoice.pdf", binary)
+  """
+  @spec download_file(Req.Request.t(), String.t(), String.t()) ::
+          {:ok, binary()} | {:error, term()}
+  def download_file(req, entity_path, filename) do
+    url = ReqAcumatica.rest_url(req, "#{entity_path}/files/#{URI.encode(filename)}")
+
+    case Req.get(req, url: url, raw: true) do
+      {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
+      {:ok, resp} -> {:error, error_from_response(resp)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Lists file attachments on an entity.
+
+  Returns filenames from the entity's `FileURLs` field or `_links`.
+  """
+  @spec list_files(Req.Request.t(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_files(req, entity_path) do
+    case get(req, entity_path) do
+      {:ok, entity} ->
+        files =
+          case entity do
+            %{"FileURLs" => urls} when is_list(urls) ->
+              Enum.map(urls, fn
+                %{"value" => url} -> url |> String.split("/") |> List.last() |> URI.decode()
+                url when is_binary(url) -> url |> String.split("/") |> List.last() |> URI.decode()
+                _ -> nil
+              end)
+              |> Enum.reject(&is_nil/1)
+
+            _ ->
+              []
+          end
+
+        {:ok, files}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  # -- Custom Fields --
+
+  @doc """
+  Extracts a custom field value from an entity response.
+
+  Custom fields in Acumatica are nested as:
+  `custom.{ScreenView}.{FieldName}.value`
+
+  ## Examples
+
+      entity = %{"custom" => %{"Item" => %{"UsrMyField" => %{"value" => "hello"}}}}
+      ReqAcumatica.REST.get_custom_field(entity, "Item", "UsrMyField")
+      # => "hello"
+
+      # Get all custom fields for a view
+      ReqAcumatica.REST.get_custom_fields(entity, "Item")
+      # => %{"UsrMyField" => "hello", ...}
+  """
+  @spec get_custom_field(map(), String.t(), String.t()) :: term()
+  def get_custom_field(entity, view, field_name) do
+    get_in(entity, ["custom", view, field_name, "value"])
+  end
+
+  @doc """
+  Returns all custom fields for a view as a flat map.
+  """
+  @spec get_custom_fields(map(), String.t()) :: map()
+  def get_custom_fields(entity, view) do
+    case get_in(entity, ["custom", view]) do
+      fields when is_map(fields) ->
+        Map.new(fields, fn {name, spec} ->
+          {name, if(is_map(spec), do: spec["value"], else: spec)}
+        end)
+
+      _ ->
+        %{}
+    end
+  end
+
+  @doc """
+  Builds the custom field structure for create/update requests.
+
+  ## Examples
+
+      custom = ReqAcumatica.REST.build_custom_fields("Item", %{
+        "UsrMyField" => "hello",
+        "UsrCount" => 42
+      })
+      # => %{"custom" => %{"Item" => %{"UsrMyField" => %{"value" => "hello"}, ...}}}
+
+      # Merge into entity body
+      body = Map.merge(%{"InventoryID" => %{"value" => "ITEM01"}}, custom)
+      ReqAcumatica.REST.create(req, "StockItem", body)
+  """
+  @spec build_custom_fields(String.t(), map()) :: map()
+  def build_custom_fields(view, fields) when is_map(fields) do
+    wrapped =
+      Map.new(fields, fn {name, value} ->
+        {name, %{"value" => value}}
+      end)
+
+    %{"custom" => %{view => wrapped}}
+  end
+
   @doc """
   Describes an entity's schema by fetching type information from the swagger spec.
 

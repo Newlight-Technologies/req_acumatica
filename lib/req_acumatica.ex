@@ -86,6 +86,8 @@ defmodule ReqAcumatica do
         |> Req.Request.put_private(:acumatica_api_version, api_version)
         |> Req.Request.put_private(:acumatica_oauth2_opts, oauth2_private_opts(auth, opts))
         |> maybe_attach_token_refresh(resolved_auth)
+        |> maybe_attach_auth_retry(resolved_auth)
+        |> maybe_attach_rate_limiter(opts)
 
       {:error, _} = error ->
         error
@@ -239,6 +241,68 @@ defmodule ReqAcumatica do
 
   defp maybe_attach_token_refresh(req, _auth), do: req
 
+  # Response step: retry on 401 by re-authenticating and replaying the request
+  defp maybe_attach_auth_retry(req, {:session_token, _}),
+    do: Req.Request.prepend_response_steps(req, acumatica_auth_retry: &auth_retry_step/1)
+
+  defp maybe_attach_auth_retry(req, {:oauth2_token, _}),
+    do: Req.Request.prepend_response_steps(req, acumatica_auth_retry: &auth_retry_step/1)
+
+  defp maybe_attach_auth_retry(req, _auth), do: req
+
+  defp auth_retry_step({request, %Req.Response{status: 401} = response}) do
+    if Req.Request.get_private(request, :acumatica_auth_retried, false) do
+      {request, response}
+    else
+      case re_authenticate(request) do
+        {:ok, request} ->
+          request
+          |> Req.Request.put_private(:acumatica_auth_retried, true)
+          |> Req.Request.run_request()
+          |> then(fn {req, resp_or_err} -> Req.Request.halt(req, resp_or_err) end)
+
+        :error ->
+          {request, response}
+      end
+    end
+  end
+
+  defp auth_retry_step(other), do: other
+
+  defp re_authenticate(request) do
+    case request.private[:acumatica_auth] do
+      {:session_token, session} ->
+        case ReqAcumatica.Session.refresh(session) do
+          {:ok, new_session} ->
+            {:ok,
+             request
+             |> Req.Request.put_private(:acumatica_auth, {:session_token, new_session})
+             |> Req.Request.put_header("cookie", new_session.cookies)}
+
+          {:error, _} ->
+            :error
+        end
+
+      {:oauth2_token, token} ->
+        base_url = request.private[:acumatica_base_url]
+        oauth2_opts = request.private[:acumatica_oauth2_opts]
+
+        case refresh_or_reacquire(token, base_url, oauth2_opts) do
+          {:ok, new_token} ->
+            {:ok,
+             request
+             |> Req.Request.put_private(:acumatica_auth, {:oauth2_token, new_token})
+             |> Req.Request.put_header("authorization", "Bearer #{new_token.access_token}")}
+
+          {:error, _} ->
+            :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
   defp token_refresh_step(request) do
     token =
       case request.private[:acumatica_auth] do
@@ -310,4 +374,29 @@ defmodule ReqAcumatica do
   end
 
   defp refresh_or_reacquire(_token, _base_url, _opts), do: {:error, :no_oauth2_config}
+
+  # -- Rate Limiting --
+
+  defp maybe_attach_rate_limiter(req, opts) do
+    case Keyword.get(opts, :rate_limiter) do
+      nil ->
+        req
+
+      server ->
+        req
+        |> Req.Request.put_private(:acumatica_rate_limiter, server)
+        |> Req.Request.prepend_request_steps(acumatica_rate_limit: &rate_limit_step/1)
+    end
+  end
+
+  defp rate_limit_step(request) do
+    case request.private[:acumatica_rate_limiter] do
+      nil ->
+        request
+
+      server ->
+        :ok = ReqAcumatica.RateLimiter.acquire(server)
+        request
+    end
+  end
 end

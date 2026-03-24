@@ -285,4 +285,151 @@ defmodule ReqAcumatica.RESTTest do
       assert ReqAcumatica.REST.unwrap_values(42) == 42
     end
   end
+
+  describe "attach_file/4" do
+    test "uploads binary content" do
+      bypass = Bypass.open()
+
+      Bypass.expect_once(
+        bypass,
+        "PUT",
+        "#{@entity_base}/PurchaseOrder/PO-001/files/doc.pdf",
+        fn conn ->
+          assert Plug.Conn.get_req_header(conn, "content-type") == ["application/octet-stream"]
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+          assert body == "pdf-binary-data"
+          Plug.Conn.resp(conn, 200, "")
+        end
+      )
+
+      assert :ok =
+               ReqAcumatica.REST.attach_file(
+                 new_req(bypass),
+                 "PurchaseOrder/PO-001",
+                 "doc.pdf",
+                 {:binary, "pdf-binary-data"}
+               )
+    end
+  end
+
+  describe "download_file/3" do
+    test "downloads binary content" do
+      bypass = Bypass.open()
+
+      Bypass.expect_once(
+        bypass,
+        "GET",
+        "#{@entity_base}/PurchaseOrder/PO-001/files/doc.pdf",
+        fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/pdf")
+          |> Plug.Conn.resp(200, "pdf-binary-data")
+        end
+      )
+
+      assert {:ok, "pdf-binary-data"} =
+               ReqAcumatica.REST.download_file(
+                 new_req(bypass),
+                 "PurchaseOrder/PO-001",
+                 "doc.pdf"
+               )
+    end
+  end
+
+  describe "custom fields" do
+    test "get_custom_field extracts value" do
+      entity = %{
+        "custom" => %{
+          "Item" => %{
+            "UsrMyField" => %{"type" => "CustomStringField", "value" => "hello"},
+            "UsrCount" => %{"type" => "CustomIntField", "value" => 42}
+          }
+        }
+      }
+
+      assert ReqAcumatica.REST.get_custom_field(entity, "Item", "UsrMyField") == "hello"
+      assert ReqAcumatica.REST.get_custom_field(entity, "Item", "UsrCount") == 42
+      assert ReqAcumatica.REST.get_custom_field(entity, "Item", "Nope") == nil
+      assert ReqAcumatica.REST.get_custom_field(entity, "BadView", "UsrMyField") == nil
+    end
+
+    test "get_custom_fields returns flat map" do
+      entity = %{
+        "custom" => %{
+          "Item" => %{
+            "UsrA" => %{"value" => "alpha"},
+            "UsrB" => %{"value" => 99}
+          }
+        }
+      }
+
+      assert %{"UsrA" => "alpha", "UsrB" => 99} =
+               ReqAcumatica.REST.get_custom_fields(entity, "Item")
+    end
+
+    test "build_custom_fields creates correct structure" do
+      result = ReqAcumatica.REST.build_custom_fields("Item", %{"UsrX" => "val", "UsrY" => 10})
+
+      assert result == %{
+               "custom" => %{
+                 "Item" => %{
+                   "UsrX" => %{"value" => "val"},
+                   "UsrY" => %{"value" => 10}
+                 }
+               }
+             }
+    end
+  end
+
+  describe "401 auth retry" do
+    test "retries on 401 with session auth" do
+      bypass = Bypass.open()
+      call_count = :counters.new(1, [:atomics])
+
+      # Login endpoint for session refresh
+      Bypass.expect(bypass, "POST", "/entity/auth/login", fn conn ->
+        conn
+        |> Plug.Conn.prepend_resp_headers([
+          {"set-cookie", "ASP.NET_SessionId=refreshed; path=/"},
+          {"set-cookie", ".ASPXAUTH=newauth; path=/"}
+        ])
+        |> Plug.Conn.resp(204, "")
+      end)
+
+      # First call returns 401, second succeeds
+      Bypass.expect(bypass, "GET", "#{@entity_base}/StockItem", fn conn ->
+        count = :counters.get(call_count, 1) + 1
+        :counters.put(call_count, 1, count)
+
+        if count <= 1 do
+          Plug.Conn.resp(conn, 401, "")
+        else
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.resp(200, Jason.encode!([%{"InventoryID" => %{"value" => "ITEM1"}}]))
+        end
+      end)
+
+      req =
+        ReqAcumatica.new(
+          base_url: "http://localhost:#{bypass.port}",
+          tenant: "TEST",
+          auth:
+            {:session_token,
+             %ReqAcumatica.Session{
+               cookies: "old-cookie",
+               logged_in_at: DateTime.utc_now(),
+               base_url: "http://localhost:#{bypass.port}",
+               username: "admin",
+               password: "pass",
+               company: "TEST"
+             }}
+        )
+
+      assert {:ok, [item]} = ReqAcumatica.REST.list(req, "StockItem", top: 1)
+      assert item["InventoryID"]["value"] == "ITEM1"
+      # Should have retried (2 calls to StockItem)
+      assert :counters.get(call_count, 1) == 2
+    end
+  end
 end
