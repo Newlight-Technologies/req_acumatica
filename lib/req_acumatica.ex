@@ -39,6 +39,8 @@ defmodule ReqAcumatica do
   @type auth ::
           {:basic, username :: String.t(), password :: String.t()}
           | {:bearer, token :: String.t()}
+          | {:session, username :: String.t(), password :: String.t(), company :: String.t()}
+          | {:session_token, ReqAcumatica.Session.t()}
           | {:oauth2, client_id :: String.t(), client_secret :: String.t(),
              username :: String.t(), password :: String.t()}
           | {:oauth2_token, ReqAcumatica.Auth.t()}
@@ -187,6 +189,30 @@ defmodule ReqAcumatica do
     end
   end
 
+  defp resolve_auth({:session, username, password, company}, base_url, _tenant, _opts) do
+    case ReqAcumatica.Session.login(
+           base_url: base_url,
+           username: username,
+           password: password,
+           company: company
+         ) do
+      {:ok, session} ->
+        {:ok, [{"cookie", session.cookies}], {:session_token, session}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp resolve_auth(
+         {:session_token, %ReqAcumatica.Session{} = session},
+         _base_url,
+         _tenant,
+         _opts
+       ) do
+    {:ok, [{"cookie", session.cookies}], {:session_token, session}}
+  end
+
   defp resolve_auth({:oauth2_token, %ReqAcumatica.Auth{} = token}, _base_url, _tenant, _opts) do
     {:ok, [{"authorization", "Bearer #{token.access_token}"}], {:oauth2_token, token}}
   end
@@ -207,6 +233,10 @@ defmodule ReqAcumatica do
     Req.Request.prepend_request_steps(req, acumatica_token_refresh: &token_refresh_step/1)
   end
 
+  defp maybe_attach_token_refresh(req, {:session_token, _session}) do
+    Req.Request.prepend_request_steps(req, acumatica_session_refresh: &session_refresh_step/1)
+  end
+
   defp maybe_attach_token_refresh(req, _auth), do: req
 
   defp token_refresh_step(request) do
@@ -225,6 +255,28 @@ defmodule ReqAcumatica do
           request
           |> Req.Request.put_private(:acumatica_auth, {:oauth2_token, new_token})
           |> Req.Request.put_header("authorization", "Bearer #{new_token.access_token}")
+
+        {:error, _} ->
+          request
+      end
+    else
+      request
+    end
+  end
+
+  defp session_refresh_step(request) do
+    session =
+      case request.private[:acumatica_auth] do
+        {:session_token, s} -> s
+        _ -> nil
+      end
+
+    if session && ReqAcumatica.Session.expired?(session) do
+      case ReqAcumatica.Session.refresh(session) do
+        {:ok, new_session} ->
+          request
+          |> Req.Request.put_private(:acumatica_auth, {:session_token, new_session})
+          |> Req.Request.put_header("cookie", new_session.cookies)
 
         {:error, _} ->
           request
