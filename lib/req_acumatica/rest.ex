@@ -295,6 +295,162 @@ defmodule ReqAcumatica.REST do
 
   def unwrap_values(other), do: other
 
+  @doc """
+  Describes an entity's schema by fetching type information from the swagger spec.
+
+  Returns a map of field names to their types and metadata, including nested
+  detail entities (arrays).
+
+  ## Examples
+
+      {:ok, schema} = ReqAcumatica.REST.describe(req, "StockItem")
+      # => %{
+      #   "InventoryID" => %{type: :string},
+      #   "AverageCost" => %{type: :decimal},
+      #   "IsAKit" => %{type: :boolean},
+      #   "LastModifiedDateTime" => %{type: :datetime},
+      #   "NoteID" => %{type: :guid},
+      #   "Details" => %{type: :array, entity: "SalesOrderDetail"},
+      #   ...
+      # }
+
+      # List all available entities
+      {:ok, entities} = ReqAcumatica.REST.describe(req)
+  """
+  @spec describe(Req.Request.t(), String.t() | nil) ::
+          {:ok, map() | [String.t()]} | {:error, term()}
+  def describe(req, entity_name \\ nil) do
+    base_url = req.private[:acumatica_base_url]
+    version = req.private[:acumatica_api_version]
+    tenant = req.private[:acumatica_tenant]
+    url = "#{base_url}/entity/Default/#{version}/swagger.json"
+
+    case Req.get(req, url: url, params: [{"company", tenant}]) do
+      {:ok, %Req.Response{status: 200, body: body}} when is_map(body) ->
+        schemas = get_in(body, ["components", "schemas"]) || %{}
+
+        if entity_name do
+          describe_entity(schemas, entity_name)
+        else
+          describe_all(body, schemas)
+        end
+
+      {:ok, resp} ->
+        {:error, error_from_response(resp)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp describe_entity(schemas, entity_name) do
+    case schemas[entity_name] do
+      nil ->
+        {:error,
+         %ReqAcumatica.Error{message: "Entity '#{entity_name}' not found in swagger schema"}}
+
+      schema ->
+        props = extract_properties(schema)
+
+        fields =
+          Map.new(props, fn {name, spec} ->
+            {name, resolve_field_type(spec, schemas)}
+          end)
+          |> Map.reject(fn {k, _} ->
+            k in ["_links", "custom", "id", "note", "rowNumber", "_workflowActions", "FileURLs"]
+          end)
+
+        {:ok, fields}
+    end
+  end
+
+  defp describe_all(body, schemas) do
+    paths = Map.keys(body["paths"] || %{})
+
+    entities =
+      paths
+      |> Enum.map(fn p -> String.trim_leading(p, "/") end)
+      |> Enum.reject(fn p ->
+        String.contains?(p, "{") or String.contains?(p, "$") or String.contains?(p, "/")
+      end)
+      |> Enum.sort()
+
+    actions =
+      paths
+      |> Enum.filter(fn p ->
+        parts = p |> String.trim_leading("/") |> String.split("/")
+
+        length(parts) == 2 and not String.starts_with?(Enum.at(parts, 1), "$") and
+          not String.starts_with?(Enum.at(parts, 1), "{")
+      end)
+      |> Enum.group_by(
+        fn p -> p |> String.trim_leading("/") |> String.split("/") |> hd() end,
+        fn p -> p |> String.trim_leading("/") |> String.split("/") |> List.last() end
+      )
+
+    entity_info =
+      Enum.map(entities, fn name ->
+        has_schema = Map.has_key?(schemas, name)
+        entity_actions = Map.get(actions, name, [])
+
+        %{
+          name: name,
+          has_schema: has_schema,
+          actions: entity_actions,
+          field_count:
+            if(has_schema, do: schemas[name] |> extract_properties() |> map_size(), else: 0)
+        }
+      end)
+
+    {:ok, entity_info}
+  end
+
+  defp extract_properties(%{"allOf" => parts}) do
+    Enum.reduce(parts, %{}, fn
+      %{"properties" => props}, acc -> Map.merge(acc, props)
+      _, acc -> acc
+    end)
+  end
+
+  defp extract_properties(%{"properties" => props}), do: props
+  defp extract_properties(_), do: %{}
+
+  @type_map %{
+    "StringValue" => :string,
+    "IntValue" => :integer,
+    "ShortValue" => :integer,
+    "LongValue" => :integer,
+    "DecimalValue" => :decimal,
+    "DoubleValue" => :decimal,
+    "BooleanValue" => :boolean,
+    "DateTimeValue" => :datetime,
+    "GuidValue" => :guid,
+    "CustomStringField" => :string,
+    "CustomIntField" => :integer,
+    "CustomDecimalField" => :decimal,
+    "CustomBooleanField" => :boolean,
+    "CustomDateTimeField" => :datetime,
+    "CustomGuidField" => :guid
+  }
+
+  defp resolve_field_type(%{"$ref" => ref}, _schemas) do
+    type_name = ref |> String.split("/") |> List.last()
+    %{type: Map.get(@type_map, type_name, :string), raw_type: type_name}
+  end
+
+  defp resolve_field_type(%{"type" => "array", "items" => items}, _schemas) do
+    entity =
+      case items["$ref"] do
+        nil -> "unknown"
+        ref -> ref |> String.split("/") |> List.last()
+      end
+
+    %{type: :array, entity: entity}
+  end
+
+  defp resolve_field_type(%{"type" => type}, _schemas), do: %{type: String.to_atom(type)}
+  defp resolve_field_type(spec, _schemas), do: %{type: :unknown, raw: spec}
+
   # -- Private --
 
   defp build_params(opts) do
