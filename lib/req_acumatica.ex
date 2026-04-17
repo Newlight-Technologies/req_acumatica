@@ -54,8 +54,8 @@ defmodule ReqAcumatica do
 
   ## Options
 
-    * `:base_url` (required) — The Acumatica instance URL (e.g. `"https://mycompany.acumatica.com"`)
-    * `:tenant` (required) — The tenant/company name (e.g. `"NEWLIGHT LIVE"`)
+    * `:base_url` (required) — The Acumatica instance URL (e.g. `"https://example.acumatica.com"`)
+    * `:tenant` (required) — The tenant/company name (e.g. `"MAIN"`)
     * `:auth` (required) — Authentication credentials (see module docs)
     * `:scope` — OAuth2 scope (default: `"api offline_access"`)
     * `:api_version` — REST API contract version (default: `"24.200.001"`)
@@ -64,9 +64,9 @@ defmodule ReqAcumatica do
 
       req = Req.new(retry: :transient)
             |> ReqAcumatica.attach(
-              base_url: "https://newlight.acumatica.com",
-              tenant: "NEWLIGHT LIVE",
-              auth: {:basic, "apiuser", "secret"}
+              base_url: "https://example.acumatica.com",
+              tenant: "MAIN",
+              auth: {:basic, "api-user", "secret-password"}
             )
   """
   @spec attach(Req.Request.t(), keyword()) :: Req.Request.t() | {:error, term()}
@@ -102,9 +102,9 @@ defmodule ReqAcumatica do
   ## Examples
 
       req = ReqAcumatica.new(
-        base_url: "https://newlight.acumatica.com",
-        tenant: "NEWLIGHT LIVE",
-        auth: {:oauth2, "client-id", "client-secret", "apiuser", "password"}
+        base_url: "https://example.acumatica.com",
+        tenant: "MAIN",
+        auth: {:oauth2, "client-id", "client-secret", "api-user", "password"}
       )
   """
   @spec new(keyword()) :: Req.Request.t() | {:error, term()}

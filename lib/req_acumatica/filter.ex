@@ -17,8 +17,8 @@ defmodule ReqAcumatica.Filter do
       filter =
         eq("Status", "Open")
         |> and_filter(gt("OrderTotal", 1000))
-        |> and_filter(contains("CustomerName", "Newlight"))
-      # => "Status eq 'Open' and OrderTotal gt 1000 and contains(CustomerName, 'Newlight')"
+        |> and_filter(contains("CustomerName", "Acme"))
+      # => "Status eq 'Open' and OrderTotal gt 1000 and contains(CustomerName, 'Acme')"
 
       # Use in a query
       ReqAcumatica.query(client, "Sales Orders", filter: to_string(filter))

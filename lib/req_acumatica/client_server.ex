@@ -12,17 +12,17 @@ defmodule ReqAcumatica.ClientServer do
   Configure via application environment:
 
       config :req_acumatica,
-        base_url: "https://mycompany.acumatica.com",
-        tenant: "MY TENANT",
-        auth: {:oauth2, "client-id", "client-secret", "apiuser", "password"},
+        base_url: "https://example.acumatica.com",
+        tenant: "MAIN",
+        auth: {:oauth2, "client-id", "client-secret", "api-user", "password"},
         scope: "api offline_access"
 
   Or pass options directly when starting:
 
       ReqAcumatica.ClientServer.start_link(
-        base_url: "https://mycompany.acumatica.com",
-        tenant: "MY TENANT",
-        auth: {:oauth2, "client-id", "client-secret", "apiuser", "password"}
+        base_url: "https://example.acumatica.com",
+        tenant: "MAIN",
+        auth: {:oauth2, "client-id", "client-secret", "api-user", "password"}
       )
 
   ## Usage

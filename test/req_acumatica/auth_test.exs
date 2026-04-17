@@ -54,7 +54,7 @@ defmodule ReqAcumatica.AuthTest do
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         params = URI.decode_query(body)
 
-        assert params["client_id"] == "test-client@NEWLIGHT LIVE"
+        assert params["client_id"] == "test-client@MAIN"
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
@@ -75,7 +75,7 @@ defmodule ReqAcumatica.AuthTest do
                  client_secret: "test-secret",
                  username: "admin",
                  password: "pass",
-                 tenant: "NEWLIGHT LIVE"
+                 tenant: "MAIN"
                )
     end
 

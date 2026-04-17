@@ -18,11 +18,11 @@ defmodule ReqAcumatica.Auth do
 
       # Acquire a token
       {:ok, token} = ReqAcumatica.Auth.acquire_token(
-        base_url: "https://mycompany.acumatica.com",
+        base_url: "https://example.acumatica.com",
         client_id: "your-client-id",
         client_secret: "your-client-secret",
-        username: "apiuser",
-        password: "secret",
+        username: "api-user",
+        password: "secret-password",
         scope: "api offline_access"
       )
 
@@ -31,7 +31,7 @@ defmodule ReqAcumatica.Auth do
 
       # Refresh an existing token
       {:ok, refreshed} = ReqAcumatica.Auth.refresh_token(token,
-        base_url: "https://mycompany.acumatica.com",
+        base_url: "https://example.acumatica.com",
         client_id: "your-client-id",
         client_secret: "your-client-secret"
       )

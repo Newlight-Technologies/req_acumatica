@@ -12,10 +12,10 @@ defmodule ReqAcumatica.Session do
   ## Usage
 
       {:ok, session} = ReqAcumatica.Session.login(
-        base_url: "https://mycompany.acumatica.com",
-        username: "apiuser",
-        password: "secret",
-        company: "NEWLIGHT LIVE"
+        base_url: "https://example.acumatica.com",
+        username: "api-user",
+        password: "secret-password",
+        company: "MAIN"
       )
 
       session.cookies

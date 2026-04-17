@@ -43,7 +43,7 @@ defmodule ReqAcumatica.FilterTest do
 
   describe "string functions" do
     test "contains" do
-      assert "#{contains("Name", "Newlight")}" == "contains(Name, 'Newlight')"
+      assert "#{contains("Name", "Acme")}" == "contains(Name, 'Acme')"
     end
 
     test "startswith" do
@@ -81,10 +81,10 @@ defmodule ReqAcumatica.FilterTest do
       filter =
         eq("Status", "Open")
         |> and_filter(gt("OrderTotal", 1000))
-        |> and_filter(contains("CustomerName", "Newlight"))
+        |> and_filter(contains("CustomerName", "Acme"))
 
       assert "#{filter}" ==
-               "Status eq 'Open' and OrderTotal gt 1000 and contains(CustomerName, 'Newlight')"
+               "Status eq 'Open' and OrderTotal gt 1000 and contains(CustomerName, 'Acme')"
     end
   end
 

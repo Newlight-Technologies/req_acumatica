@@ -96,15 +96,15 @@ defmodule ReqAcumaticaTest do
       req =
         ReqAcumatica.new(
           base_url: "https://example.acumatica.com",
-          tenant: "NEWLIGHT LIVE",
+          tenant: "MAIN",
           auth: {:basic, "admin", "pass"}
         )
 
       assert ReqAcumatica.odata_url(req) ==
-               "https://example.acumatica.com/odata/NEWLIGHT%20LIVE/"
+               "https://example.acumatica.com/odata/MAIN/"
 
       assert ReqAcumatica.odata_url(req, "MyInquiry") ==
-               "https://example.acumatica.com/odata/NEWLIGHT%20LIVE/MyInquiry"
+               "https://example.acumatica.com/odata/MAIN/MyInquiry"
     end
   end
 
