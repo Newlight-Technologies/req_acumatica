@@ -69,6 +69,7 @@ defmodule ReqAcumatica.REST do
           | {:skip, non_neg_integer()}
           | {:select, String.t()}
           | {:expand, String.t()}
+          | {:custom_fields, String.t()}
           | {:custom, String.t()}
 
   @doc """
@@ -80,8 +81,11 @@ defmodule ReqAcumatica.REST do
     * `:top` — maximum number of results
     * `:skip` — number of results to skip
     * `:select` — comma-separated field names to return
-    * `:expand` — related entities to include (e.g. `"Details"`)
-    * `:custom` — custom query string to append verbatim
+    * `:expand` — related entities to include (e.g. `"Details"` or `"Details,TaxDetails,files"`)
+    * `:custom_fields` — `$custom` value for Usr fields (e.g. `"Document.UsrField"`)
+    * `:custom` — raw query string key to append verbatim (escape hatch)
+
+  Note: this is a single page. For a bounded multi-page pull use `list_all/3`.
   """
   @spec list(Req.Request.t(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def list(req, entity_name, opts \\ []) do
@@ -101,6 +105,41 @@ defmodule ReqAcumatica.REST do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Retrieves entities across multiple pages via `$top`/`$skip`, bounded by `:max_results`.
+
+  The REST contract API returns at most one page per request; this helper paginates
+  until a short page is returned or `:max_results` is reached. Always pass `:max_results`
+  for non-browse use so a full read cannot happen by accident.
+
+  ## Options
+
+  All `list/3` options, plus:
+
+    * `:page_size` — rows per request (default `200`)
+    * `:max_results` — hard cap on total rows (default `:infinity`)
+
+  Any `:top`/`:skip` passed in `opts` are ignored — the paginator owns them.
+
+  With `:max_results: :infinity` (the default) termination relies on the endpoint
+  eventually returning a short/empty page. A hard guard of 10,000 pages returns
+  `{:error, :pagination_page_limit_exceeded}` so an endpoint that ignores `$top`/`$skip`
+  cannot loop forever.
+
+  ## Examples
+
+      {:ok, rows} = ReqAcumatica.REST.list_all(req, "Bill", filter: "Status eq 'Open'", max_results: 1000)
+  """
+  @spec list_all(Req.Request.t(), String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_all(req, entity_name, opts \\ []) do
+    page_size = Keyword.get(opts, :page_size, 200)
+    max_results = Keyword.get(opts, :max_results, :infinity)
+    base_opts = Keyword.drop(opts, [:page_size, :max_results, :top, :skip])
+
+    do_paginate(req, entity_name, base_opts, page_size, max_results, 0, 0, 0, [])
   end
 
   @doc """
@@ -171,6 +210,10 @@ defmodule ReqAcumatica.REST do
   plus any fields to update, all in Acumatica's value wrapper format.
 
   Returns the updated entity on success.
+
+  > Note: the contract API has no separate create/update — both `create/3` and
+  > `update/3` issue `PUT {Entity}` (an upsert keyed on the body's key fields). The two
+  > functions differ only in intent/accepted status codes; pick by what reads clearer.
   """
   @spec update(Req.Request.t(), String.t(), map()) :: {:ok, map()} | {:error, term()}
   def update(req, entity_name, body) do
@@ -340,15 +383,15 @@ defmodule ReqAcumatica.REST do
   end
 
   @doc """
-  Downloads a file attachment from an entity.
+  Downloads a file attachment from an entity **by filename**.
 
-  Returns the raw binary content.
+  Returns the raw binary content via `GET {entity_path}/files/{filename}`. Note that
+  Acumatica filenames are often folder-prefixed (e.g.
+  `"Bills and Adjustments (ACR 004849)\\\\invoice.pdf"`), which makes this path fragile.
+  Prefer `download_file_by_id/2` with a FileID from `list_files/2`.
 
   ## Examples
 
-      {:ok, binary} = ReqAcumatica.REST.download_file(req, "PurchaseOrder/PO-001", "invoice.pdf")
-
-      # Download to file
       {:ok, binary} = ReqAcumatica.REST.download_file(req, "PurchaseOrder/PO-001", "invoice.pdf")
       File.write!("/tmp/invoice.pdf", binary)
   """
@@ -365,32 +408,49 @@ defmodule ReqAcumatica.REST do
   end
 
   @doc """
-  Lists file attachments on an entity.
+  Downloads a file attachment by its FileID.
 
-  Returns filenames from the entity's `FileURLs` field or `_links`.
+  This is the preferred download path (`GET files/{FileID}`). FileIDs come from
+  `list_files/2` (each entry's `"id"`), avoiding the fragile folder-prefixed filename
+  that `download_file/3` requires.
+
+  ## Examples
+
+      {:ok, [%{"id" => id} | _]} = ReqAcumatica.REST.list_files(req, "Bill/Invoice/004849")
+      {:ok, binary} = ReqAcumatica.REST.download_file_by_id(req, id)
   """
-  @spec list_files(Req.Request.t(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  @spec download_file_by_id(Req.Request.t(), String.t()) :: {:ok, binary()} | {:error, term()}
+  def download_file_by_id(req, file_id) do
+    url = ReqAcumatica.rest_url(req, "files/#{URI.encode(file_id)}")
+
+    case Req.get(req, url: url, raw: true) do
+      {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
+      {:ok, resp} -> {:error, error_from_response(resp)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Lists file attachments on an entity via `$expand=files`.
+
+  Returns the raw `files` array from the entity response. Each entry is a map with
+  `"filename"`, `"href"`, and `"id"` (the FileID). Download a file with
+  `download_file_by_id/2`.
+
+  > Note: this uses `$expand=files`. The older `FileURLs` field is not returned by the
+  > contract endpoint, so do not rely on it.
+
+  ## Examples
+
+      {:ok, files} = ReqAcumatica.REST.list_files(req, "Bill/Invoice/004849")
+      # => [%{"filename" => "...", "href" => "/entity/.../files/<id>", "id" => "<id>"}]
+  """
+  @spec list_files(Req.Request.t(), String.t()) :: {:ok, [map()]} | {:error, term()}
   def list_files(req, entity_path) do
-    case get(req, entity_path) do
-      {:ok, entity} ->
-        files =
-          case entity do
-            %{"FileURLs" => urls} when is_list(urls) ->
-              Enum.map(urls, fn
-                %{"value" => url} -> url |> String.split("/") |> List.last() |> URI.decode()
-                url when is_binary(url) -> url |> String.split("/") |> List.last() |> URI.decode()
-                _ -> nil
-              end)
-              |> Enum.reject(&is_nil/1)
-
-            _ ->
-              []
-          end
-
-        {:ok, files}
-
-      {:error, _} = error ->
-        error
+    case get(req, entity_path, expand: "files") do
+      {:ok, %{"files" => files}} when is_list(files) -> {:ok, files}
+      {:ok, _} -> {:ok, []}
+      {:error, _} = error -> error
     end
   end
 
@@ -459,10 +519,35 @@ defmodule ReqAcumatica.REST do
   end
 
   @doc """
-  Describes an entity's schema by fetching type information from the swagger spec.
+  Fetches an entity's **live** ad-hoc schema (`GET {Entity}/$adHocSchema`).
+
+  Unlike `describe/2` (which reads the static `swagger.json` and can diverge from a
+  tenant's live endpoint — e.g. listing a field that is not actually expandable), this
+  returns the schema the running endpoint actually serves, including real custom fields.
+
+  ## Examples
+
+      {:ok, schema} = ReqAcumatica.REST.ad_hoc_schema(req, "StockItem")
+  """
+  @spec ad_hoc_schema(Req.Request.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def ad_hoc_schema(req, entity_name) do
+    url = ReqAcumatica.rest_url(req, "#{entity_name}/$adHocSchema")
+
+    case Req.get(req, url: url) do
+      {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
+      {:ok, resp} -> {:error, error_from_response(resp)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Describes an entity's schema from the static `swagger.json` spec.
 
   Returns a map of field names to their types and metadata, including nested
   detail entities (arrays).
+
+  > Note: `swagger.json` is static and may diverge from the live endpoint (it can list
+  > fields that are not live-expandable). Use `ad_hoc_schema/2` for the live schema.
 
   ## Examples
 
@@ -616,6 +701,63 @@ defmodule ReqAcumatica.REST do
 
   # -- Private --
 
+  # Hard guard against an endpoint that ignores $top/$skip and never returns a short page
+  # (only reachable with :max_results: :infinity). 10_000 pages * default 200 = 2M rows.
+  @max_pages 10_000
+
+  # `chunks` holds page row-lists in reverse order; `count` tracks the running total so we
+  # never call length/1 on the accumulator. This keeps the whole pull linear.
+  defp do_paginate(_req, _entity, _opts, _page_size, _max_results, _skip, page, _count, _chunks)
+       when page >= @max_pages do
+    {:error, :pagination_page_limit_exceeded}
+  end
+
+  defp do_paginate(req, entity_name, base_opts, page_size, max_results, skip, page, count, chunks) do
+    remaining =
+      case max_results do
+        :infinity -> page_size
+        n -> min(page_size, n - count)
+      end
+
+    if remaining <= 0 do
+      {:ok, finish_pages(chunks)}
+    else
+      page_opts = base_opts |> Keyword.put(:top, remaining) |> Keyword.put(:skip, skip)
+
+      case list(req, entity_name, page_opts) do
+        {:ok, []} ->
+          {:ok, finish_pages(chunks)}
+
+        {:ok, rows} ->
+          n = length(rows)
+          chunks = [rows | chunks]
+          count = count + n
+          hit_cap? = max_results != :infinity and count >= max_results
+
+          if n < remaining or hit_cap? do
+            {:ok, finish_pages(chunks)}
+          else
+            do_paginate(
+              req,
+              entity_name,
+              base_opts,
+              page_size,
+              max_results,
+              skip + n,
+              page + 1,
+              count,
+              chunks
+            )
+          end
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
+  defp finish_pages(chunks), do: chunks |> Enum.reverse() |> Enum.concat()
+
   defp build_params(opts) do
     Enum.reduce(opts, [], fn
       {:filter, value}, acc -> [{"$filter", value} | acc]
@@ -623,6 +765,7 @@ defmodule ReqAcumatica.REST do
       {:skip, value}, acc -> [{"$skip", to_string(value)} | acc]
       {:select, value}, acc -> [{"$select", value} | acc]
       {:expand, value}, acc -> [{"$expand", value} | acc]
+      {:custom_fields, value}, acc -> [{"$custom", value} | acc]
       {:custom, value}, acc -> [{value, nil} | acc]
       _, acc -> acc
     end)
