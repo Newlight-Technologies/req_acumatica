@@ -336,6 +336,136 @@ defmodule ReqAcumatica.RESTTest do
     end
   end
 
+  describe "download_file_by_id/2" do
+    test "downloads by FileID via files/{id}" do
+      bypass = Bypass.open()
+
+      Bypass.expect_once(bypass, "GET", "#{@entity_base}/files/5ff82cde", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/pdf")
+        |> Plug.Conn.resp(200, "pdf-bytes")
+      end)
+
+      assert {:ok, "pdf-bytes"} =
+               ReqAcumatica.REST.download_file_by_id(new_req(bypass), "5ff82cde")
+    end
+  end
+
+  describe "list_files/2" do
+    test "lists files via $expand=files returning filename/href/id maps" do
+      bypass = Bypass.open()
+
+      Bypass.expect_once(bypass, "GET", "#{@entity_base}/Bill/Invoice/004849", fn conn ->
+        assert URI.decode_query(conn.query_string)["$expand"] == "files"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(
+          200,
+          Jason.encode!(%{
+            "ReferenceNbr" => %{"value" => "004849"},
+            "files" => [
+              %{
+                "filename" => "Bills\\inv.pdf",
+                "href" => "/entity/Default/24.200.001/files/abc",
+                "id" => "abc"
+              }
+            ]
+          })
+        )
+      end)
+
+      assert {:ok, [%{"filename" => "Bills\\inv.pdf", "id" => "abc", "href" => _}]} =
+               ReqAcumatica.REST.list_files(new_req(bypass), "Bill/Invoice/004849")
+    end
+
+    test "returns [] when the entity has no files key" do
+      bypass = Bypass.open()
+
+      Bypass.expect_once(bypass, "GET", "#{@entity_base}/StockItem/X", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, Jason.encode!(%{"InventoryID" => %{"value" => "X"}}))
+      end)
+
+      assert {:ok, []} = ReqAcumatica.REST.list_files(new_req(bypass), "StockItem/X")
+    end
+  end
+
+  describe "list_all/3" do
+    test "paginates via $top/$skip and stops on a short page" do
+      bypass = Bypass.open()
+
+      Bypass.expect(bypass, "GET", "#{@entity_base}/Bill", fn conn ->
+        skip = (URI.decode_query(conn.query_string)["$skip"] || "0") |> String.to_integer()
+
+        rows =
+          case skip do
+            0 -> [%{"i" => %{"value" => 0}}, %{"i" => %{"value" => 1}}]
+            2 -> [%{"i" => %{"value" => 2}}]
+            _ -> []
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, Jason.encode!(rows))
+      end)
+
+      assert {:ok, rows} = ReqAcumatica.REST.list_all(new_req(bypass), "Bill", page_size: 2)
+      assert length(rows) == 3
+    end
+
+    test "respects :max_results cap" do
+      bypass = Bypass.open()
+
+      Bypass.expect(bypass, "GET", "#{@entity_base}/Bill", fn conn ->
+        top = URI.decode_query(conn.query_string)["$top"] |> String.to_integer()
+        rows = for _ <- 1..top, do: %{"i" => %{"value" => 1}}
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, Jason.encode!(rows))
+      end)
+
+      assert {:ok, rows} =
+               ReqAcumatica.REST.list_all(new_req(bypass), "Bill", page_size: 2, max_results: 5)
+
+      assert length(rows) == 5
+    end
+  end
+
+  describe ":custom_fields option" do
+    test "maps to the $custom query param" do
+      bypass = Bypass.open()
+
+      Bypass.expect_once(bypass, "GET", "#{@entity_base}/StockItem", fn conn ->
+        assert URI.decode_query(conn.query_string)["$custom"] == "Item.UsrFoo"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, Jason.encode!([]))
+      end)
+
+      assert {:ok, []} =
+               ReqAcumatica.REST.list(new_req(bypass), "StockItem", custom_fields: "Item.UsrFoo")
+    end
+  end
+
+  describe "ad_hoc_schema/2" do
+    test "fetches the live schema via $adHocSchema" do
+      bypass = Bypass.open()
+
+      Bypass.expect_once(bypass, "GET", "#{@entity_base}/StockItem/$adHocSchema", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, Jason.encode!(%{"InventoryID" => %{}, "FileURLs" => %{}}))
+      end)
+
+      assert {:ok, %{"InventoryID" => _}} =
+               ReqAcumatica.REST.ad_hoc_schema(new_req(bypass), "StockItem")
+    end
+  end
+
   describe "custom fields" do
     test "get_custom_field extracts value" do
       entity = %{
