@@ -121,17 +121,25 @@ defmodule ReqAcumatica.REST do
     * `:page_size` — rows per request (default `200`)
     * `:max_results` — hard cap on total rows (default `:infinity`)
 
+  Any `:top`/`:skip` passed in `opts` are ignored — the paginator owns them.
+
+  With `:max_results: :infinity` (the default) termination relies on the endpoint
+  eventually returning a short/empty page. A hard guard of 10,000 pages returns
+  `{:error, :pagination_page_limit_exceeded}` so an endpoint that ignores `$top`/`$skip`
+  cannot loop forever.
+
   ## Examples
 
       {:ok, rows} = ReqAcumatica.REST.list_all(req, "Bill", filter: "Status eq 'Open'", max_results: 1000)
   """
-  @spec list_all(Req.Request.t(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  @spec list_all(Req.Request.t(), String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
   def list_all(req, entity_name, opts \\ []) do
     page_size = Keyword.get(opts, :page_size, 200)
     max_results = Keyword.get(opts, :max_results, :infinity)
     base_opts = Keyword.drop(opts, [:page_size, :max_results, :top, :skip])
 
-    do_paginate(req, entity_name, base_opts, page_size, max_results, 0, [])
+    do_paginate(req, entity_name, base_opts, page_size, max_results, 0, 0, 0, [])
   end
 
   @doc """
@@ -693,29 +701,41 @@ defmodule ReqAcumatica.REST do
 
   # -- Private --
 
-  defp do_paginate(req, entity_name, base_opts, page_size, max_results, skip, acc) do
+  # Hard guard against an endpoint that ignores $top/$skip and never returns a short page
+  # (only reachable with :max_results: :infinity). 10_000 pages * default 200 = 2M rows.
+  @max_pages 10_000
+
+  # `chunks` holds page row-lists in reverse order; `count` tracks the running total so we
+  # never call length/1 on the accumulator. This keeps the whole pull linear.
+  defp do_paginate(_req, _entity, _opts, _page_size, _max_results, _skip, page, _count, _chunks)
+       when page >= @max_pages do
+    {:error, :pagination_page_limit_exceeded}
+  end
+
+  defp do_paginate(req, entity_name, base_opts, page_size, max_results, skip, page, count, chunks) do
     remaining =
       case max_results do
         :infinity -> page_size
-        n -> min(page_size, n - length(acc))
+        n -> min(page_size, n - count)
       end
 
     if remaining <= 0 do
-      {:ok, acc}
+      {:ok, finish_pages(chunks)}
     else
       page_opts = base_opts |> Keyword.put(:top, remaining) |> Keyword.put(:skip, skip)
 
       case list(req, entity_name, page_opts) do
         {:ok, []} ->
-          {:ok, acc}
+          {:ok, finish_pages(chunks)}
 
         {:ok, rows} ->
-          acc = acc ++ rows
-          last_page? = length(rows) < remaining
-          hit_cap? = max_results != :infinity and length(acc) >= max_results
+          n = length(rows)
+          chunks = [rows | chunks]
+          count = count + n
+          hit_cap? = max_results != :infinity and count >= max_results
 
-          if last_page? or hit_cap? do
-            {:ok, acc}
+          if n < remaining or hit_cap? do
+            {:ok, finish_pages(chunks)}
           else
             do_paginate(
               req,
@@ -723,8 +743,10 @@ defmodule ReqAcumatica.REST do
               base_opts,
               page_size,
               max_results,
-              skip + length(rows),
-              acc
+              skip + n,
+              page + 1,
+              count,
+              chunks
             )
           end
 
@@ -733,6 +755,8 @@ defmodule ReqAcumatica.REST do
       end
     end
   end
+
+  defp finish_pages(chunks), do: chunks |> Enum.reverse() |> Enum.concat()
 
   defp build_params(opts) do
     Enum.reduce(opts, [], fn
